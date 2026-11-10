@@ -1,89 +1,173 @@
 import dns from "node:dns";
 dns.setDefaultResultOrder("ipv4first");
+
 import "dotenv/config";
-import express from "express"
-import cors from "cors"
-import helmet from "helmet"
-import rateLimit from "express-rate-limit"
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import OpenAI from "openai";
 import { GoogleGenAI } from "@google/genai";
 
 const app = express();
-
 app.set("trust proxy", 1);
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const TIMEOUT_MS = 15000; // per-provider timeout before falling back to the next one
 
-//Security Middleware
-app.use(helmet());
-
-app.use(cors({
-    origin: process.env.FRONTEND_URL || "http://localhost:3000",
-    credentials: true
-}));
-
-// Rate Limiting
-
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 100, // limit each IP to 100 requests per windowMs
-    message: "Too many requests from this IP, please try again later"
+// ---------- Clients ----------
+const groq = new OpenAI({
+    apiKey: process.env.GROQ_API_KEY,
+    baseURL: "https://api.groq.com/openai/v1",
 });
 
-app.use(limiter);
-app.use(express.json({ limit: "10mb" })); //limit our request size to 10mb at max
+const vercelGateway = new OpenAI({
+    apiKey: process.env.AI_GATEWAY_API_KEY,
+    baseURL: "https://ai-gateway.vercel.sh/v1", // verify in Vercel's AI Gateway docs
+});
 
-function withTimeout(promise, ms) {
+const gemini = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+// ---------- Helpers ----------
+function withTimeout(promise, ms, label) {
     let timer;
     const timeout = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`Gemini timed out after ${ms}ms`)), ms);
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
     });
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+function buildPrompt(code, language) {
+    const lang = language || "programming";
+    return `Explain the following ${lang} code to a beginner.
+
+Rules:
+- Keep the whole answer under 250 words.
+- Use a short intro (1-2 sentences), then a numbered step-by-step walkthrough.
+- Mention only the key concepts. No horizontal rules, no "what it does / why it's needed" repetition.
+- Always finish your final sentence.
+
+\`\`\`${language || ""}
+${code}
+\`\`\``;
+}
+
+async function callOpenAICompatible(client, model, prompt) {
+    const r = await client.chat.completions.create(
+        {
+            model,
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.3,
+            max_tokens: 1200,
+        },
+        { timeout: TIMEOUT_MS, maxRetries: 0 }
+    );
+    const choice = r.choices?.[0];
+    if (!choice?.message?.content) throw new Error("Empty response");
+    if (choice.finish_reason !== "stop") {
+        throw new Error(`Incomplete response (finish_reason: ${choice.finish_reason})`);
+    }
+    return choice.message.content;
+}
+
+async function callGemini(prompt, code) {
+    const thinkingLevel = code.length > 1500 ? "medium" : "low";
+    const response = await gemini.interactions.create({
+        model: "gemini-3.8-flash",
+        input: prompt,
+        generation_config: {
+            temperature: 0.3,
+            max_output_tokens: 1500,
+            thinking_level: thinkingLevel,
+        },
+    });
+    console.log("gemini usage:", response.usage);
+    if (response.status !== "completed") {
+        throw new Error(`Incomplete response (status: ${response.status})`);
+    }
+    if (!response.output_text) throw new Error("Empty response");
+    return response.output_text;
+}
+
+// ---------- Provider chain (tried in order) ----------
+const providers = [
+    {
+        name: "groq",
+        run: (prompt) => callOpenAICompatible(groq, "openai/gpt-oss-120b", prompt),
+    },
+    {
+        name: "vercel-nemotron",
+        run: (prompt) =>
+            callOpenAICompatible(vercelGateway, "nvidia/nemotron-3.5-lightning-free", prompt),
+    },
+    {
+        name: "gemini",
+        run: (prompt, code) => callGemini(prompt, code),
+    },
+];
+
+async function explainWithFallback(prompt, code) {
+    const errors = [];
+    for (const provider of providers) {
+        try {
+            const text = await withTimeout(
+                provider.run(prompt, code),
+                TIMEOUT_MS,
+                provider.name
+            );
+            return { text, provider: provider.name };
+        } catch (err) {
+            console.warn(`[${provider.name}] failed: ${err.message}`);
+            errors.push(`${provider.name}: ${err.message}`);
+        }
+    }
+    throw new Error(`All providers failed. ${errors.join(" | ")}`);
+}
+
+// ---------- Middleware ----------
+app.use(helmet());
+
+app.use(
+    cors({
+        origin: process.env.FRONTEND_URL || "http://localhost:5173",
+        credentials: true,
+    })
+);
+
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+    message: "Too many requests from this IP, please try again later",
+});
+
+app.use(limiter);
+app.use(express.json({ limit: "10mb" }));
+
+// ---------- Routes ----------
+app.get("/health", (req, res) => res.sendStatus(200));
+
 app.post("/api/explain-code", async (req, res) => {
     try {
         const { code, language } = req.body;
-        if (!code) {
-            return res.status(502).json({ error: "Empty response from the model. Code is required" });
-        }
-        const thinkingLevel = code.length > 1500 ? "medium" : "low";
-        const t0 = Date.now();
-        const response = await withTimeout(
-            ai.interactions.create({
-                model: "gemini-3.8-flash",
-                input: `Explain the following ${language || "programming"} code to a beginner.
 
-        Rules:
-        - Keep the whole answer under 250 words.
-        - Use a short intro (1-2 sentences), then a numbered step-by-step walkthrough.
-        - Mention only the key concepts. No horizontal rules, no "what it does / why it's needed" repetition.
-        - Always finish your final sentence.
-        \`\`\`${language || ""}
-        ${code}
-        \`\`\``,
-                generation_config: {
-                    temperature: 0.3,
-                    max_output_tokens: 1500, // headroom: 250 words is roughly 350-400 tokens
-                    thinking_level: thinkingLevel,
-                },
-            }),
-            20000);
-        console.log(`Gemini responded in ${Date.now() - t0}ms`);
-        // console.log("usage:", response.usage); //displays how much tokens are used
-        if (response.status !== "completed") {
-            console.warn("Incomplete response, status:", response.status);
-            return res.status(502).json({ error: "Response was incomplete, please try again" });
-        }
-        const explanation = response?.output_text;
-        if (!explanation) {
+        if (!code || typeof code !== "string") {
             return res.status(400).json({ error: "Code is required" });
         }
-        console.log(explanation);
-        res.json({ explanation, language: language || "unknown" });
-    }
-    catch (err) {
+
+        const prompt = buildPrompt(code, language);
+        const { text, provider } = await explainWithFallback(prompt, code);
+
+        console.log(`Explanation generated by: ${provider}`);
+        res.json({
+            explanation: text,
+            language: language || "unknown",
+            provider,
+        });
+    } catch (err) {
         console.error("Code Explain API Error:", err);
-        res.status(500).json({ error: "Server error", details: err.message });
+        res.status(502).json({
+            error: "All AI providers failed, please try again",
+            details: err.message,
+        });
     }
 });
 
